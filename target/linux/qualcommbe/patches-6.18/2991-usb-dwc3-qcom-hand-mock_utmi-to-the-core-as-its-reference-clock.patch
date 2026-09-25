@@ -1,0 +1,59 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] usb: dwc3: qcom: hand mock_utmi to the core as its reference clock
+
+The qcom,snps-dwc3 binding describes mock_utmi as the clock "needed for
+ITP/SOF generation in host mode", i.e. the DWC3 reference clock whose
+period the core programs into GUCTL.REFCLKPER and corrects with
+GFLADJ.REFCLK_FLADJ. Before the controller node was flattened the child
+snps,dwc3 node of IPQ5018/IPQ5332 passed exactly this clock to the core
+as "ref"; the flattened core takes no clocks of its own, so nothing
+programs the period any more and the controller keeps its reset default
+of 52 ns (19.2 MHz).
+
+That happens to be right on the SoCs that clock mock_utmi at 19.2 MHz
+(the defaults read back as REFCLKPER=52, REFCLK_FLADJ=200,
+240MHZDECR=12/PLS1=1, which is what dwc3_ref_clk_period() computes for
+19.2 MHz). On IPQ5332 the GCC only provides 60 MHz, so every microframe
+comes out 3.1x too short: SuperSpeed devices still work (no SOF timer
+involved) but a high-speed device fails every descriptor read with
+-EPROTO. The vendor kernel programs REFCLKPER=16 and REFCLK_FLADJ=0x1459
+through its own DT quirks - the same values dwc3_ref_clk_period() derives
+from a 60 MHz clock.
+
+Look the clock up by its binding name and store it in the core's ref_clk
+before dwc3_core_probe(). The core prepares it (a second reference on a
+clock the glue already holds) and uses its rate; the glue keeps owning
+it through its clock bulk, so suspend/resume stay balanced.
+
+Tested on GL.iNet GL-BE3600 (IPQ5332): a USB 3.2 flash drive forced to
+USB 2 by disabling the SuperSpeed hub port now enumerates and transfers
+at high speed; before the change it could not read its descriptor.
+
+---
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -757,6 +757,24 @@
+ 
+ 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
+ 
++	/*
++	 * mock_utmi is the core's reference clock for ITP/SOF generation (see
++	 * the binding). The flattened core takes no clocks of its own, so hand
++	 * this one over for the GUCTL.REFCLKPER / GFLADJ programming in
++	 * dwc3_ref_clk_period(). On the SoCs that run it at 19.2 MHz this
++	 * reproduces the reset defaults; on IPQ5332 it runs at 60 MHz and
++	 * without it every microframe is 3.1x too short and no high-speed
++	 * device can be enumerated (SuperSpeed does not use the SOF timer).
++	 * The core only prepares the clock and reads its rate; the glue keeps
++	 * owning it through its clock bulk.
++	 */
++	qcom->dwc.ref_clk = devm_clk_get_optional(dev, "mock_utmi");
++	if (IS_ERR(qcom->dwc.ref_clk)) {
++		ret = dev_err_probe(dev, PTR_ERR(qcom->dwc.ref_clk),
++				    "failed to get mock_utmi clock\n");
++		goto icc_exit;
++	}
++
+ 	probe_data.dwc = &qcom->dwc;
+ 	probe_data.res = &res;
+ 	probe_data.ignore_clocks_and_resets = true;

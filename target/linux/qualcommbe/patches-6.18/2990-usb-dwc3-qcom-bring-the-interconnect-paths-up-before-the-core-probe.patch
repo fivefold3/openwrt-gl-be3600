@@ -1,0 +1,114 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] usb: dwc3: qcom: bring the interconnect paths up before the core probe
+
+On IPQ5332 and IPQ9574 the interconnect provider is icc-clk: the usb-ddr
+and apps-usb paths are literally the NoC clocks of the USB controller
+(gcc_snoc_usb_clk on IPQ5332), enabled when bandwidth is requested and
+gated again when the paths are released.
+
+dwc3_qcom_probe() registers the core first and only then calls
+dwc3_qcom_interconnect_init(). dwc3_core_probe() reads GSNPSID and the
+hardware parameter registers immediately, so on those SoCs it relies on
+the NoC clock happening to be on already - true for the first probe
+after boot (the reset default, kept by clk_ignore_unused), false for any
+probe after the paths were released. A driver rebind therefore hangs the
+CPU on the first register read of the gated block; observed on the
+GL-BE3600 as an RCU stall with the probing CPU unresponsive to NMI, ended
+by the watchdog.
+
+Bring the paths up right after the clocks and before any register
+access, which is the order dwc3_qcom_resume() already uses, and tear them
+down in the reverse order.
+
+Tested on GL.iNet GL-BE3600 (IPQ5332): five unbind/bind cycles, the port
+re-enumerates a SuperSpeed device after each.
+
+---
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -695,10 +695,25 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * On SoCs whose interconnect provider is icc-clk (IPQ5332, IPQ9574)
++	 * the "usb-ddr"/"apps-usb" paths are the NoC clocks of the controller
++	 * itself, gated whenever no bandwidth is requested. They have to be up
++	 * before the first register access - dwc3_core_probe() reads the core
++	 * straight away - so bring the paths up here, as the resume path
++	 * already does, instead of after the core has been registered. Without
++	 * this a rebind (or any probe after the paths were released) hangs the
++	 * CPU on the first read of the gated block.
++	 */
++	qcom->dwc.dev = dev;
++	ret = dwc3_qcom_interconnect_init(qcom);
++	if (ret)
++		goto clk_disable;
++
+ 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!r) {
+ 		ret = -EINVAL;
+-		goto clk_disable;
++		goto icc_exit;
+ 	}
+ 	res = *r;
+ 	res.end = res.start + SDM845_QSCRATCH_BASE_OFFSET;
+@@ -707,13 +722,13 @@
+ 	if (!qcom->qscratch_base) {
+ 		dev_err(dev, "failed to map qscratch region\n");
+ 		ret = -ENOMEM;
+-		goto clk_disable;
++		goto icc_exit;
+ 	}
+ 
+ 	ret = dwc3_qcom_setup_irq(qcom, pdev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to setup IRQs, err=%d\n", ret);
+-		goto clk_disable;
++		goto icc_exit;
+ 	}
+ 
+ 	/*
+@@ -742,20 +757,15 @@
+ 
+ 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
+ 
+-	qcom->dwc.dev = dev;
+ 	probe_data.dwc = &qcom->dwc;
+ 	probe_data.res = &res;
+ 	probe_data.ignore_clocks_and_resets = true;
+ 	ret = dwc3_core_probe(&probe_data);
+ 	if (ret)  {
+ 		ret = dev_err_probe(dev, ret, "failed to register DWC3 Core\n");
+-		goto clk_disable;
++		goto icc_exit;
+ 	}
+ 
+-	ret = dwc3_qcom_interconnect_init(qcom);
+-	if (ret)
+-		goto remove_core;
+-
+ 	wakeup_source = of_property_read_bool(dev->of_node, "wakeup-source");
+ 	device_init_wakeup(&pdev->dev, wakeup_source);
+ 
+@@ -763,8 +773,8 @@
+ 
+ 	return 0;
+ 
+-remove_core:
+-	dwc3_core_remove(&qcom->dwc);
++icc_exit:
++	dwc3_qcom_interconnect_exit(qcom);
+ clk_disable:
+ 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+ 
+@@ -780,8 +790,8 @@
+ 		return;
+ 
+ 	dwc3_core_remove(&qcom->dwc);
+-	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+ 	dwc3_qcom_interconnect_exit(qcom);
++	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+ 	dwc3_qcom_usb_mux_setup(qcom, false);
+ 
+ 	pm_runtime_put_noidle(qcom->dev);

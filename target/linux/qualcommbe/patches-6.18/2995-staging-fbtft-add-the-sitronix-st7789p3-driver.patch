@@ -1,0 +1,392 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] staging: fbtft: add the Sitronix ST7789P3 driver
+
+fbtft driver for the ST7789P3 as fitted to the GL.iNet Slate 7 (GL-BE3600)
+76x284 side screen. The init sequence, the frame-memory offsets (82/18) and
+the tearing-effect handling are those of the stock GL.iNet 4.9.2 / QSDK 5.4
+fb_st7789p3 driver, so the stock device-tree node carries over unchanged.
+It attaches the board's pwm-backlight (the node's "backlight" phandle) to the
+framebuffer so FBIOBLANK switches it, waits for the TE pulse before each
+frame write, and supports rotate 0/90/180/270.
+
+Verified on the device.
+
+---
+ drivers/staging/fbtft/Kconfig      |   8 +
+ drivers/staging/fbtft/Makefile     |   1 +
+drivers/staging/fbtft/fb_st7789p3.c | 341 ++++++++++++++++++++++
+ 3 files changed, 350 insertions(+)
+ create mode 100644 drivers/staging/fbtft/fb_st7789p3.c
+
+diff -ruN a/drivers/staging/fbtft/Kconfig b/drivers/staging/fbtft/Kconfig
+--- a/drivers/staging/fbtft/Kconfig
++++ b/drivers/staging/fbtft/Kconfig
+@@ -145,6 +145,13 @@
+ 
+ 	  Say Y if you have such a display that utilizes this controller.
+ 
++config FB_TFT_ST7789P3
++	tristate "FB driver for the ST7789P3 LCD Controller"
++	help
++	  Framebuffer support for the Sitronix ST7789P3 display controller as
++	  fitted to the GL.iNet Slate 7 (GL-BE3600) 76x284 side screen: stock
++	  init sequence, frame-memory offsets and tearing-effect sync.
++
+ config FB_TFT_TINYLCD
+ 	tristate "FB driver for tinylcd.com display"
+ 	help
+diff -ruN a/drivers/staging/fbtft/Makefile b/drivers/staging/fbtft/Makefile
+--- a/drivers/staging/fbtft/Makefile
++++ b/drivers/staging/fbtft/Makefile
+@@ -31,6 +31,7 @@
+ obj-$(CONFIG_FB_TFT_SSD1351)     += fb_ssd1351.o
+ obj-$(CONFIG_FB_TFT_ST7735R)     += fb_st7735r.o
+ obj-$(CONFIG_FB_TFT_ST7789V)     += fb_st7789v.o
++obj-$(CONFIG_FB_TFT_ST7789P3)    += fb_st7789p3.o
+ obj-$(CONFIG_FB_TFT_TINYLCD)     += fb_tinylcd.o
+ obj-$(CONFIG_FB_TFT_TLS8204)     += fb_tls8204.o
+ obj-$(CONFIG_FB_TFT_UC1611)      += fb_uc1611.o
+diff -ruN a/drivers/staging/fbtft/fb_st7789p3.c b/drivers/staging/fbtft/fb_st7789p3.c
+--- a/drivers/staging/fbtft/fb_st7789p3.c
++++ b/drivers/staging/fbtft/fb_st7789p3.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * fbtft driver for the Sitronix ST7789P3 TFT controller as fitted to the
++ * GL.iNet Slate 7 (GL-BE3600) side screen: a 76x284 panel centred in the
++ * controller's 240x320 frame memory (column offset 82, row offset 18),
++ * driven over BLSP SPI at 50 MHz with a tearing-effect line. The device is
++ * described in the board DTS (ipq5332-gl-be3600.dts).
++ *
++ * The init sequence, window offsets, MADCTL mapping and TE handling are
++ * those of the stock (GL.iNet 4.9.2 / QSDK 5.4) fb_st7789p3 driver, so the
++ * device-tree node can be carried over from the stock DTB unchanged:
++ *
++ *	compatible = "sitronix,st7789p3";
++ *	width = <76>; height = <284>; buswidth = <8>; fps = <40>;
++ *	dc-gpios, reset-gpios (active low), te-gpios;
++ *	backlight = <&backlight>;   (pwm-backlight, exposed as fb0's backlight)
++ */
++
++#include <linux/backlight.h>
++#include <linux/bitops.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/spi/spi.h>
++
++#include <video/mipi_display.h>
++
++#include "fbtft.h"
++
++#define DRVNAME		"fb_st7789p3"
++
++#define PANEL_WIDTH	76
++#define PANEL_HEIGHT	284
++
++/* Panel position inside the 240x320 frame memory (symmetric, so the same
++ * offsets hold for every MADCTL mirror; they swap when MV is set).
++ */
++#define COL_OFFSET	82
++#define ROW_OFFSET	18
++
++/* Commands not named by <video/mipi_display.h> (datasheet names). */
++enum st7789p3_command {
++	RAMCTRL = 0xB0,
++	PORCTRL = 0xB2,
++	GCTRL = 0xB7,
++	VCOMS = 0xBB,
++	LCMCTRL = 0xC0,
++	VDVVRHEN = 0xC2,
++	VRHS = 0xC3,
++	VDVS = 0xC4,
++	FRCTRL2 = 0xC6,
++	PWCTRL1 = 0xD0,
++	ST7789P3_D6 = 0xD6,	/* P3-specific, set to 0xA1 by the vendor init */
++	PVGAMCTRL = 0xE0,
++	NVGAMCTRL = 0xE1,
++};
++
++#define MADCTL_BGR	BIT(3)
++#define MADCTL_MV	BIT(5)
++#define MADCTL_MX	BIT(6)
++#define MADCTL_MY	BIT(7)
++
++/* One frame at the 60 Hz the panel is programmed for is 16.7 ms. */
++#define PANEL_TE_TIMEOUT_MS	40
++
++struct st7789p3_priv {
++	struct completion te;
++	int te_irq;
++};
++
++/* Handed from probe() to register_backlight(); one panel per board. */
++static struct backlight_device *st7789p3_bl;
++
++static irqreturn_t panel_te_handler(int irq, void *data)
++{
++	struct st7789p3_priv *priv = data;
++
++	complete(&priv->te);
++	return IRQ_HANDLED;
++}
++
++static int init_tearing_effect_line(struct fbtft_par *par)
++{
++	struct device *dev = par->info->device;
++	struct st7789p3_priv *priv = par->extra;
++	struct gpio_desc *te;
++	int irq, rc;
++
++	te = gpiod_get_optional(dev, "te", GPIOD_IN);
++	if (IS_ERR(te))
++		return dev_err_probe(dev, PTR_ERR(te), "failed to request te GPIO\n");
++	if (!te)
++		return 0;
++
++	irq = gpiod_to_irq(te);
++	/* the line is locked as an IRQ, the descriptor can go */
++	gpiod_put(te);
++	if (irq < 0) {
++		dev_warn(dev, "te GPIO has no IRQ (%d), not syncing to TE\n", irq);
++		return 0;
++	}
++
++	init_completion(&priv->te);
++	/* TE goes high for < 1 ms at the start of each vertical blank */
++	rc = devm_request_irq(dev, irq, panel_te_handler, IRQF_TRIGGER_RISING,
++			      "st7789p3-te", priv);
++	if (rc)
++		return dev_err_probe(dev, rc, "TE IRQ request failed\n");
++
++	disable_irq_nosync(irq);
++	priv->te_irq = irq;
++	return 0;
++}
++
++static int init_display(struct fbtft_par *par)
++{
++	struct backlight_device *bl = par->info->bl_dev;
++	struct st7789p3_priv *priv;
++	int rc;
++
++	priv = devm_kzalloc(par->info->device, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	par->extra = priv;
++
++	par->fbtftops.reset(par);
++
++	rc = init_tearing_effect_line(par);
++	if (rc)
++		return rc;
++
++	/* keep the backlight off until the panel shows something sane */
++	if (bl) {
++		bl->props.power = BACKLIGHT_POWER_OFF;
++		backlight_update_status(bl);
++	}
++
++	/* porch: back/front porch 12 lines, idle/partial 0x33 */
++	write_reg(par, PORCTRL, 0x0C, 0x0C, 0x00, 0x33, 0x33);
++	write_reg(par, RAMCTRL, 0x00, 0xE0);
++	write_reg(par, MIPI_DCS_SET_ADDRESS_MODE, 0x00);
++	write_reg(par, MIPI_DCS_SET_PIXEL_FORMAT, MIPI_DCS_PIXEL_FMT_16BIT);
++	/* VGH/VGL */
++	write_reg(par, GCTRL, 0x45);
++	/* VCOM */
++	write_reg(par, VCOMS, 0x1D);
++	write_reg(par, LCMCTRL, 0x2C);
++	/* VDV/VRH from registers rather than NVM */
++	write_reg(par, VDVVRHEN, 0x01);
++	write_reg(par, VRHS, 0x19);
++	write_reg(par, VDVS, 0x20);
++	/* 60 Hz frame rate in normal mode */
++	write_reg(par, FRCTRL2, 0x0F);
++	/* AVDD 6.8 V, AVCL -4.8 V, VDS 2.3 V */
++	write_reg(par, PWCTRL1, 0xA4, 0xA1);
++	/* TE output on, V-blank only */
++	write_reg(par, MIPI_DCS_SET_TEAR_ON, 0x00);
++	write_reg(par, ST7789P3_D6, 0xA1);
++	write_reg(par, PVGAMCTRL,
++		  0xD0, 0x10, 0x21, 0x14, 0x15, 0x2D, 0x41,
++		  0x44, 0x4F, 0x28, 0x0E, 0x0C, 0x1D, 0x1F);
++	write_reg(par, NVGAMCTRL,
++		  0xD0, 0x0F, 0x1B, 0x0D, 0x0D, 0x26, 0x42,
++		  0x54, 0x50, 0x3E, 0x1A, 0x18, 0x22, 0x25);
++
++	write_reg(par, MIPI_DCS_EXIT_SLEEP_MODE);
++	msleep(120);
++	write_reg(par, MIPI_DCS_SET_DISPLAY_ON);
++	msleep(120);
++
++	/* fbtft_register_framebuffer() powers the backlight back on once the
++	 * first frame has been pushed.
++	 */
++	return 0;
++}
++
++static int write_vmem(struct fbtft_par *par, size_t offset, size_t len)
++{
++	struct st7789p3_priv *priv = par->extra;
++
++	if (priv && priv->te_irq) {
++		reinit_completion(&priv->te);
++		enable_irq(priv->te_irq);
++		if (!wait_for_completion_timeout(&priv->te,
++				msecs_to_jiffies(PANEL_TE_TIMEOUT_MS)))
++			dev_dbg(par->info->device, "TE wait timed out\n");
++		disable_irq(priv->te_irq);
++	}
++
++	return fbtft_write_vmem16_bus8(par, offset, len);
++}
++
++static void set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
++{
++	int cx = COL_OFFSET, cy = ROW_OFFSET;
++
++	/* with MV set, column and page addresses address the other axis */
++	if (par->info->var.rotate == 90 || par->info->var.rotate == 270)
++		swap(cx, cy);
++
++	xs += cx;
++	xe += cx;
++	ys += cy;
++	ye += cy;
++
++	write_reg(par, MIPI_DCS_SET_COLUMN_ADDRESS,
++		  (xs >> 8) & 0xFF, xs & 0xFF, (xe >> 8) & 0xFF, xe & 0xFF);
++	write_reg(par, MIPI_DCS_SET_PAGE_ADDRESS,
++		  (ys >> 8) & 0xFF, ys & 0xFF, (ye >> 8) & 0xFF, ye & 0xFF);
++	write_reg(par, MIPI_DCS_WRITE_MEMORY_START);
++}
++
++static int set_var(struct fbtft_par *par)
++{
++	u8 madctl = 0;
++
++	if (par->bgr)
++		madctl |= MADCTL_BGR;
++
++	switch (par->info->var.rotate) {
++	case 0:
++		break;
++	case 90:
++		madctl |= MADCTL_MV | MADCTL_MY;
++		break;
++	case 180:
++		madctl |= MADCTL_MX | MADCTL_MY;
++		break;
++	case 270:
++		madctl |= MADCTL_MV | MADCTL_MX;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	write_reg(par, MIPI_DCS_SET_ADDRESS_MODE, madctl);
++	return 0;
++}
++
++/* Blanking switches the backlight; the panel itself keeps its contents. */
++static int blank(struct fbtft_par *par, bool on)
++{
++	struct backlight_device *bl = par->info->bl_dev;
++
++	if (!bl)
++		return 0;
++
++	bl->props.power = on ? BACKLIGHT_POWER_OFF : BACKLIGHT_POWER_ON;
++	backlight_update_status(bl);
++	return 0;
++}
++
++/* Attach the board's pwm-backlight (from the "backlight" phandle) to fb0
++ * instead of the fbtft core's led-gpio backlight.
++ */
++static void register_backlight(struct fbtft_par *par)
++{
++	par->info->bl_dev = st7789p3_bl;
++}
++
++static void unregister_backlight(struct fbtft_par *par)
++{
++	struct backlight_device *bl = par->info->bl_dev;
++
++	if (!bl)
++		return;
++
++	bl->props.power = BACKLIGHT_POWER_OFF;
++	backlight_update_status(bl);
++	par->info->bl_dev = NULL;
++}
++
++static struct fbtft_display display = {
++	.regwidth = 8,
++	.buswidth = 8,
++	.width = PANEL_WIDTH,
++	.height = PANEL_HEIGHT,
++	.fps = 40,
++	.fbtftops = {
++		.init_display = init_display,
++		.write_vmem = write_vmem,
++		.set_addr_win = set_addr_win,
++		.set_var = set_var,
++		.blank = blank,
++		.register_backlight = register_backlight,
++		.unregister_backlight = unregister_backlight,
++	},
++};
++
++static int st7789p3_probe(struct spi_device *spi)
++{
++	struct backlight_device *bl;
++
++	bl = devm_of_find_backlight(&spi->dev);
++	if (IS_ERR(bl))
++		return dev_err_probe(&spi->dev, PTR_ERR(bl), "backlight lookup failed\n");
++	st7789p3_bl = bl;
++
++	return fbtft_probe_common(&display, spi, NULL);
++}
++
++static void st7789p3_remove(struct spi_device *spi)
++{
++	struct fb_info *info = spi_get_drvdata(spi);
++
++	fbtft_remove_common(&spi->dev, info);
++	st7789p3_bl = NULL;
++}
++
++static const struct of_device_id st7789p3_of_match[] = {
++	{ .compatible = "sitronix,st7789p3" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, st7789p3_of_match);
++
++static const struct spi_device_id st7789p3_spi_ids[] = {
++	{ .name = "st7789p3" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, st7789p3_spi_ids);
++
++static struct spi_driver st7789p3_spi_driver = {
++	.driver = {
++		.name = DRVNAME,
++		.of_match_table = st7789p3_of_match,
++	},
++	.id_table = st7789p3_spi_ids,
++	.probe = st7789p3_probe,
++	.remove = st7789p3_remove,
++};
++module_spi_driver(st7789p3_spi_driver);
++
++MODULE_ALIAS("spi:" DRVNAME);
++MODULE_DESCRIPTION("FB driver for the Sitronix ST7789P3 (GL.iNet Slate 7 side screen)");
++MODULE_LICENSE("GPL");

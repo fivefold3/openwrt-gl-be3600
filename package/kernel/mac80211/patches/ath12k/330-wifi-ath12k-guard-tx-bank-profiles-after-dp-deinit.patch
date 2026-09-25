@@ -1,0 +1,45 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] wifi: ath12k: do not touch the TX bank profiles after they are freed
+
+ath12k_dp_cmn_device_deinit() frees dp->bank_profiles. When a crash recovery
+fails part-way (ath12k_core_reconfigure_on_crash() returning an error) the
+interfaces still exist, and removing one later calls
+ath12k_dp_tx_put_bank_profile(), which dereferences the freed table:
+
+  Unable to handle kernel read from unreadable memory at virtual address 0x4
+  pc : ath12k_dp_tx_put_bank_profile+0x64
+  ath12k_mac_op_remove_interface -> drv_remove_interface -> ieee80211_stop
+  Kernel panic - not syncing: Oops
+
+Seen on a GL-BE3600 (IPQ5332 + QCN6432) on every interface teardown and
+reboot after a failed recovery, including a sysupgrade. Make the release a
+no-op and the allocation fail cleanly once the table is gone.
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -344,6 +344,11 @@
+ 	bank_config = ath12k_dp_arch_tx_get_vdev_bank_config(dp, arvif);
+
+ 	spin_lock_bh(&dp->tx_bank_lock);
++	if (!dp->bank_profiles) {
++		spin_unlock_bh(&dp->tx_bank_lock);
++		ath12k_err(ab, "TX bank profiles not initialised\n");
++		return bank_id;
++	}
+ 	/* TODO: implement using idr kernel framework*/
+ 	for (i = 0; i < dp->num_bank_profiles; i++) {
+ 		if (dp->bank_profiles[i].is_configured &&
+@@ -386,7 +392,12 @@
+ void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id)
+ {
+ 	spin_lock_bh(&dp->tx_bank_lock);
+-	dp->bank_profiles[bank_id].num_users--;
++	/* The profiles go with ath12k_dp_cmn_device_deinit(): after a failed
++	 * crash recovery the vifs still exist and get removed later, and the
++	 * release must not dereference the freed table.
++	 */
++	if (dp->bank_profiles && bank_id < dp->num_bank_profiles)
++		dp->bank_profiles[bank_id].num_users--;
+ 	spin_unlock_bh(&dp->tx_bank_lock);
+ }
+ 

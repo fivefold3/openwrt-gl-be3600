@@ -1,0 +1,117 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: [PATCH] input: hynitron-cst816x: complete gesture keys, parse touchscreen properties
+
+Two things found with the CST816S on the GL.iNet Slate 7 side screen:
+
+1. Gesture keys were reported with the finger state as their value and
+   only in the packet carrying the gesture. The controller reports the
+   gesture once, and a quick swipe puts it in the packet that also reports
+   the finger leaving (active = 0), so that swipe produced nothing; a slow
+   one produced a press that was never released, after which the same
+   gesture was silently filtered by the input core for good. Report the
+   gesture as a press, and release it when the finger comes up.
+
+2. The coordinates were reported raw with a fixed 0-240 range, but the
+   controller is programmed for the panel (here 284x76, X mirrored against
+   the display). Use the generic touchscreen properties (touchscreen-size-x/y,
+   -inverted-x/y, -swapped-x-y) so the device tree can describe the panel
+   and userspace gets display coordinates.
+
+---
+ .../input/touchscreen/hynitron,cst816x.yaml        |  5 ++-
+ drivers/input/touchscreen/hynitron-cst816x.c       | 41 +++++++++++++++-----
+ 2 files changed, 34 insertions(+), 12 deletions(-)
+
+diff -ruN a/Documentation/devicetree/bindings/input/touchscreen/hynitron,cst816x.yaml b/Documentation/devicetree/bindings/input/touchscreen/hynitron,cst816x.yaml
+--- a/Documentation/devicetree/bindings/input/touchscreen/hynitron,cst816x.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/hynitron,cst816x.yaml
+@@ -13,6 +13,9 @@
+   Bindings for CST816x high performance self-capacitance touch chip series
+   with single point gesture and real two-point operation.
+ 
++allOf:
++  - $ref: touchscreen.yaml#
++
+ properties:
+   compatible:
+     enum:
+@@ -41,7 +44,7 @@
+   - reg
+   - interrupts
+ 
+-additionalProperties: false
++unevaluatedProperties: false
+ 
+ examples:
+   - |
+diff -ruN a/drivers/input/touchscreen/hynitron-cst816x.c b/drivers/input/touchscreen/hynitron-cst816x.c
+--- a/drivers/input/touchscreen/hynitron-cst816x.c
++++ b/drivers/input/touchscreen/hynitron-cst816x.c
+@@ -11,6 +11,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
++#include <linux/input/touchscreen.h>
+ #include <linux/unaligned.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+@@ -29,6 +30,8 @@
+ 	struct i2c_client *client;
+ 	struct gpio_desc *reset;
+ 	struct input_dev *input;
++	struct touchscreen_properties prop;
++	unsigned int gest_key;
+ 	unsigned int keycode[CST816X_NUM_KEYS];
+ 	unsigned int keycodemax;
+ };
+@@ -141,6 +144,7 @@
+ 
+ 	input_set_abs_params(priv->input, ABS_X, 0, 240, 0, 0);
+ 	input_set_abs_params(priv->input, ABS_Y, 0, 240, 0, 0);
++	touchscreen_parse_properties(priv->input, false, &priv->prop);
+ 	input_set_capability(priv->input, EV_KEY, BTN_TOUCH);
+ 
+ 	priv->input->keycode = priv->keycode;
+@@ -173,18 +177,35 @@
+ 	if (!cst816x_process_touch(priv, &tch))
+ 		return IRQ_HANDLED;
+ 
+-	input_report_abs(priv->input, ABS_X, tch.abs_x);
+-	input_report_abs(priv->input, ABS_Y, tch.abs_y);
++	touchscreen_report_pos(priv->input, &priv->prop,
++			       tch.abs_x, tch.abs_y, false);
+ 
+-	if (tch.gest)
+-		input_report_key(priv->input,
+-				 priv->keycode[cst816x_gest_idx(tch.gest)],
+-				 tch.active);
++	/*
++	 * The controller reports a gesture in the packet in which it
++	 * recognised it, which is often the one that also reports the finger
++	 * leaving, and never again. Report it as a press and release it once
++	 * the finger is up, so every gesture is a complete key event and the
++	 * same gesture can be reported twice in a row.
++	 */
++	if (tch.gest && !priv->gest_key) {
++		u8 idx = cst816x_gest_idx(tch.gest);
++
++		if (idx < priv->keycodemax &&
++		    priv->keycode[idx] != KEY_RESERVED) {
++			priv->gest_key = priv->keycode[idx];
++			input_report_key(priv->input, priv->gest_key, 1);
++		}
++	}
+ 
+ 	input_report_key(priv->input, BTN_TOUCH, tch.active);
+-
+ 	input_sync(priv->input);
+ 
++	if (!tch.active && priv->gest_key) {
++		input_report_key(priv->input, priv->gest_key, 0);
++		input_sync(priv->input);
++		priv->gest_key = 0;
++	}
++
+ 	return IRQ_HANDLED;
+ }
+ 

@@ -1,0 +1,82 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: wifi: ath12k: take the MAC address from the device tree when given
+
+ath12k uses the address the firmware reports in the WMI ready event, which
+the firmware derives from the board data. Boards whose board data carries no
+address get an invented one from the Atheros range (00:03:7f:...) that
+differs on every firmware load, so every BSSID moves across reboots. On the
+GL-BE3600 the factory addresses live in the ART partition instead, like the
+ethernet ones.
+
+Let the device tree override it, the way other drivers do: an nvmem cell (or
+a plain mac-address property) on the wifi node wins over the firmware value.
+Nothing changes for boards that do not describe one.
+
+The lookup happens in ath12k_core_pre_init(), i.e. in probe context: the WMI
+ready event is parsed from a tasklet, where reading an nvmem cell backed by
+flash would sleep.
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1033,6 +1033,7 @@ struct ath12k_base {
+ 	wait_queue_head_t peer_mapping_wq;
+ 	u8 mac_addr[ETH_ALEN];
+ 	bool wmi_ready;
++	bool dt_mac_addr_valid;
+ 	u32 wlan_init_status;
+ 	int irq_num[ATH12K_IRQ_NUM_MAX];
+ 	struct ath12k_ext_irq_grp ext_irq_grp[ATH12K_EXT_IRQ_GRP_NUM_MAX];
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -10,6 +10,7 @@
+ #include <linux/remoteproc.h>
+ #include <linux/firmware.h>
+ #include <linux/of.h>
++#include <linux/of_net.h>
+ #include <linux/of_graph.h>
+ #include "ahb.h"
+ #include "core.h"
+@@ -1849,10 +1850,27 @@ static void ath12k_core_hw_group_set_mlo
+ int ath12k_core_pre_init(struct ath12k_base *ab)
+ {
+ 	const struct ath12k_mem_profile_based_param *param;
++	int ret;
++
++	/* Without a MAC address in the board data the firmware invents one
++	 * (Atheros OUI) and it changes on every load. Prefer the address the
++	 * device tree points at - typically an nvmem cell in a factory
++	 * partition. Read it here, in probe context: the WMI ready event that
++	 * would otherwise set ab->mac_addr is parsed from a tasklet, where a
++	 * flash-backed nvmem read must not sleep.
++	 *
++	 * Done before ath12k_fw_map(): returning -EPROBE_DEFER after it would
++	 * leak the firmware reference, as ath12k_core_free() does not unmap.
++	 */
++	ret = of_get_mac_address(ab->dev->of_node, ab->mac_addr);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	if (!ret)
++		ab->dt_mac_addr_valid = true;
+
+ 	param = &ath12k_mem_profile_based_param[ab->target_mem_mode];
+ 	ab->profile_param = param;
+ 	ath12k_fw_map(ab);
+
+ 	return 0;
+ }
+
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7074,8 +7074,10 @@ static int ath12k_wmi_rdy_parse(struct a
+ 		rdy_parse->num_extra_mac_addr =
+ 			le32_to_cpu(fixed_param.ready_event_min.num_extra_mac_addr);
+
+-		ether_addr_copy(ab->mac_addr,
+-				fixed_param.ready_event_min.mac_addr.addr);
++		/* keep the device tree address if there was one */
++		if (!ab->dt_mac_addr_valid)
++			ether_addr_copy(ab->mac_addr,
++					fixed_param.ready_event_min.mac_addr.addr);
+ 		ab->pktlog_defs_checksum = le32_to_cpu(fixed_param.pktlog_defs_checksum);
+ 		ab->wmi_ready = true;
+ 		break;

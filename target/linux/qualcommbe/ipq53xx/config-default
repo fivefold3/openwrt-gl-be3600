@@ -65,3 +65,29 @@ CONFIG_SPMI=y
 CONFIG_SPMI_MSM_PMIC_ARB=y
 # CONFIG_SPMI_PMIC_CLKDIV is not set
 CONFIG_UIMAGE_FIT_BLK=y
+# GL-BE3600 port: pstore/ramoops so a panic log survives the warm reset
+CONFIG_PSTORE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_PSTORE_CONSOLE=y
+# CONFIG_PSTORE_COMPRESS is not set
+# CONFIG_PSTORE_PMSG is not set
+# CONFIG_PSTORE_FTRACE is not set
+# GL-BE3600 side screen, built in (no kmod packages, no fbcon): fbtft panel
+# driver fb_st7789p3 (patch 2995) on BLSP0 SPI, PWM backlight, bit-banged
+# i2c + CST816S touch, evdev. /dev/fb0, /sys/class/backlight/backlight,
+# /dev/input/event0 exist from boot for any package to use.
+CONFIG_FB=y
+CONFIG_FB_DEVICE=y
+CONFIG_FB_TFT=y
+CONFIG_FB_TFT_ST7789P3=y
+CONFIG_BACKLIGHT_CLASS_DEVICE=y
+CONFIG_BACKLIGHT_PWM=y
+CONFIG_I2C_ALGOBIT=y
+CONFIG_I2C_GPIO=y
+CONFIG_INPUT=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_TOUCHSCREEN_HYNITRON_CST816X=y
+# CONFIG_TOUCHSCREEN_HYNITRON_CSTXXX is not set
+# CONFIG_INPUT_MISC is not set
+# CONFIG_VT is not set

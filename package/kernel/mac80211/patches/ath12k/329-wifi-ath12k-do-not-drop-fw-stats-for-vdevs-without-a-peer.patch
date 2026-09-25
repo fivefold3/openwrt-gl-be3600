@@ -1,0 +1,91 @@
+From: fivefold3 <332818675+fivefold3.noreply.github.com>
+Subject: wifi: ath12k: do not drop the whole fw stats event for a vdev with no peer
+
+The per-chain RSSI stats the firmware returns cover every vdev on the pdev,
+not just the one the request named. ath12k_wmi_tlv_rssi_chain_parse() looks
+up a link sta whose address equals the vdev's BSSID, which by definition
+only exists for a station vdev: an AP vdev's BSSID is its own address, so
+there is never a peer with it.
+
+For an AP vdev the lookup therefore fails and the parser returns -EPROTO.
+That aborts the TLV iteration for the entire event, so
+ath12k_update_stats_event() takes its error path and signals neither
+fw_stats_complete nor fw_stats_done. Every caller of
+ath12k_mac_get_fw_stats() then waits out its full one second timeout while
+holding ah->hw_mutex, which serialises every other stats user behind it.
+
+Running an AP and a client on one radio is enough to trigger it: each
+station-statistics query from userspace (a LuCI status poll, iwinfo, iw)
+blocks a second in D state and the log fills with
+
+  not found link sta with bssid ... for rssi chain
+  failed to pull fw stats: -71
+  time out while waiting for get fw stats
+
+ath11k had the same bug and fixed it in "ath11k: fix warning of not found
+station for bssid in message" (2022) - its parser logs at debug level and
+leaves ret at 0, which is what this tree's ath11k carries today. Do the
+same here.
+
+The vdev stats path a few hundred lines up already skips the entry; it only
+warns about it, once per poll per AP vdev. Demote that one to a debug
+message too, for the same reason: it is an expected condition, not a fault.
+
+The stats_id assignment moves ahead of the lookups for the same reason it
+sits there in ath11k - when no entry in the array has a peer, the id must
+still be set, or ath12k_update_stats_event() falls through to the vdev/bcn
+path, leaves fw_stats_done unsignalled and the caller waits three seconds
+more.
+
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -8443,9 +8443,9 @@
+ 					   "wmi stats vdev id %d snr %d\n",
+ 					   src->vdev_id, src->beacon_snr);
+ 			} else {
+-				ath12k_warn(ab,
+-					    "not found link sta with bssid %pM for vdev stat\n",
+-					    arvif->bssid);
++				ath12k_dbg(ab, ATH12K_DBG_WMI,
++					   "not found link sta with bssid %pM for vdev stat\n",
++					   arvif->bssid);
+ 			}
+ 			spin_unlock_bh(&ab->base_lock);
+ 		}
+@@ -8543,6 +8543,8 @@
+ 		return -EPROTO;
+ 	}
+ 
++	stats->stats_id = WMI_REQUEST_RSSI_PER_CHAIN_STAT;
++
+ 	arvif = ath12k_mac_get_arvif(ar, vdev_id);
+ 	if (!arvif) {
+ 		ath12k_warn(ab, "not found vif for vdev id %d\n", vdev_id);
+@@ -8556,10 +8558,14 @@
+ 	guard(spinlock_bh)(&ab->base_lock);
+ 	arsta = ath12k_link_sta_find_by_addr(ab, arvif->bssid);
+ 	if (!arsta) {
+-		ath12k_warn(ab,
+-			    "not found link sta with bssid %pM for rssi chain\n",
+-			    arvif->bssid);
+-		return -EPROTO;
++		/* The event covers every vdev on the pdev, and an AP vdev's
++		 * BSSID is its own address - no peer ever carries it. Skip
++		 * the entry rather than discarding the whole event.
++		 */
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "not found link sta with bssid %pM for rssi chain\n",
++			   arvif->bssid);
++		return 0;
+ 	}
+ 
+ 	BUILD_BUG_ON(ARRAY_SIZE(arsta->chain_signal) >
+@@ -8568,8 +8574,6 @@
+ 	for (j = 0; j < ARRAY_SIZE(arsta->chain_signal); j++)
+ 		arsta->chain_signal[j] = le32_to_cpu(stats_rssi->rssi_avg_beacon[j]);
+ 
+-	stats->stats_id = WMI_REQUEST_RSSI_PER_CHAIN_STAT;
+-
+ 	return 0;
+ }
+ 

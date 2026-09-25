@@ -1,0 +1,67 @@
+iwinfo: do not leave an interface up after scanning with it
+
+nl80211_get_scanlist() reuses an existing interface of the phy when asked
+to scan a radio that has none of its own, brings it up with iwinfo_ifup()
+and returns without restoring it. The AP path pairs ifup with ifdown; this
+one does not.
+
+It matters on drivers that allow a single station interface per radio
+(ath12k): scanning from LuCI claims the phys default interface (wlan0),
+which then holds the only station slot, so the client interface created
+from that same page is refused with -EBUSY:
+
+  wpa_supplicant: Could not set interface phy0-sta0 flags (UP): Resource busy
+
+Remember whether the interface was up and put it back down if it was not.
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -3125,13 +3125,28 @@
+ 	return (count >= 0) ? 0 : -1;
+ }
+ 
++static int nl80211_ifisup(const char *ifname)
++{
++	char path[64], buf[16];
++
++	snprintf(path, sizeof(path), "/sys/class/net/%s/flags", ifname);
++
++	if (nl80211_readstr(path, buf, sizeof(buf)) <= 0)
++		return 0;
++
++	return !!(strtoul(buf, NULL, 0) & 1);
++}
++
+ static int nl80211_get_scanlist(const char *ifname, char *buf, int *len)
+ {
+ 	char *res;
+ 	int rv, mode;
++	int was_up;
+ 
+ 	*len = 0;
+ 
++	was_up = nl80211_ifisup(ifname);
++
+ 	/* Got a radioX pseudo interface, find some interface on it or create one */
+ 	if (!strncmp(ifname, "radio", 5))
+ 	{
+@@ -3164,7 +3179,18 @@
+ 	          mode == IWINFO_OPMODE_MONITOR) &&
+ 	         iwinfo_ifup(ifname))
+ 	{
+-		return nl80211_get_scanlist_nl(ifname, buf, len);
++		rv = nl80211_get_scanlist_nl(ifname, buf, len);
++
++		/* Leave the interface as it was found: a scan must not claim an
++		 * interface that was down. On drivers that allow only one
++		 * station interface per radio (ath12k) the claimed interface
++		 * takes the slot, and the one the configuration creates
++		 * afterwards is then refused with -EBUSY.
++		 */
++		if (!was_up)
++			iwinfo_ifdown(ifname);
++
++		return rv;
+ 	}
+ 
+ 	/* AP scan */

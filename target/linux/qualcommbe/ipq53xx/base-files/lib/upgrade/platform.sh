@@ -27,8 +27,30 @@ gl_be6500_remove_oem_rootfs() {
 	}
 }
 
+# Stock GL NAND firmware keeps QSDK wifi firmware in its own UBI volume;
+# OpenWrt ships firmware in the rootfs, so reclaim the space.
+gl_remove_oem_wifi_fw() {
+	local ubidev
+	local ubivol
+
+	ubidev=$(nand_find_ubi "$CI_UBIPART")
+	[ -n "$ubidev" ] || return 0
+
+	ubivol=$(nand_find_volume "$ubidev" wifi_fw)
+	[ -z "$ubivol" ] || {
+		echo "Removing legacy wifi_fw volume"
+		ubirmvol "/dev/$ubidev" --name=wifi_fw || return 1
+	}
+}
+
 platform_do_upgrade() {
 	case "$(board_name)" in
+	gl.inet,gl-be3600)
+		CI_UBIPART="rootfs"
+		gl_be6500_remove_oem_rootfs || return 1
+		gl_remove_oem_wifi_fw || return 1
+		nand_do_upgrade "$1"
+		;;
 	gl.inet,gl-be6500)
 		CI_UBIPART="rootfs"
 		gl_be6500_remove_oem_rootfs || return 1
@@ -54,6 +76,28 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$(board_name)" in
+	gl.inet,gl-be3600)
+		# factory.bin is a QSDK container FIT (script node + the whole UBI).
+		# nand_do_platform_check deliberately ACCEPTS "fit" - on many NAND
+		# boards a kernel FIT is a legitimate sysupgrade image - but on this
+		# one the only valid sysupgrade image is the tar, and nand_upgrade_fit
+		# would write the whole container into the kernel UBI volume and leave
+		# the device unbootable. Verified: platform_check_image
+		# returned 0 for factory.bin with nand_do_platform_check alone.
+		if [ "$(get_magic_long "$1")" = "d00dfeed" ]; then
+			echo "This is the factory image (FIT). Flash it with U-Boot"
+			echo "recovery or from stock firmware, not with sysupgrade."
+			return 1
+		fi
+		# The tar is built as sysupgrade-glinet_gl-be3600/ - the image profile
+		# name, NOT board_name (gl.inet,gl-be3600). nand_do_platform_check only
+		# substitutes commas and underscores, so it can never turn "gl.inet"
+		# into "glinet"; passing board_name here rejects every valid image.
+		# (Measured: CONTROL is 23 bytes under glinet_gl-be3600, 0 under the
+		# board_name spelling. This is likely why the BE6500 arm is a bare
+		# "return 0".)
+		nand_do_platform_check "glinet_gl-be3600" "$1"
+		;;
 	gl.inet,gl-be6500)
 		return 0
 		;;
