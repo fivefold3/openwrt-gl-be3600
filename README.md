@@ -141,9 +141,10 @@ sysupgrade path it would land in the kernel UBI volume and leave the device
 unbootable. The upgrade also removes the stock firmware's `wifi_fw` UBI
 volume, which OpenWrt does not use.
 
-**First boot.** LAN and WAN jacks hand out DHCP leases from 192.168.1.1
-(also the failsafe address). LuCI and `ssh root@192.168.1.1`, no password.
-2.4 GHz Wi-Fi is present but disabled, as OpenWrt does by default.
+**First boot.** The LAN jack hands out DHCP leases from 192.168.1.1 (also the
+failsafe address); the WAN jack is the uplink and takes its own address by
+DHCP. LuCI and `ssh root@192.168.1.1`, no password. Both Wi-Fi radios are
+present but disabled, as OpenWrt does by default.
 
 **Regulatory country.** Both radios take the country code stored in the
 unit's ART partition (offset 0x88), the same value the stock firmware reads:
