@@ -268,7 +268,7 @@
 		"disassoc_low_ack": {
 			"description": "Disassociate stations based on excessive transmission failures or other indications of connection loss. This depends on the driver capabilities and may not be available with all drivers.",
 			"type": "boolean",
-			"default": true
+			"default": false
 		},
 		"domain_match": {
 			"type": "array",
