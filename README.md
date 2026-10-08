@@ -1,18 +1,21 @@
 # OpenWrt for the GL.iNet Slate 7 (GL-BE3600)
 
-OpenWrt support for the **GL.iNet Slate 7 (GL-BE3600)** travel router:
-Qualcomm **IPQ5332** (quad Cortex-A53), dual-band Wi-Fi 7, two 2.5 GbE ports,
-USB 3.0, and the side touch screen.
+OpenWrt firmware for the **GL.iNet Slate 7 (GL-BE3600, BE3600)** Wi-Fi 7
+travel router: Qualcomm **IPQ5332** (quad Cortex-A53), dual-band Wi-Fi 7, two
+2.5 GbE ports, USB 3.0, and the side touch screen.
 
-This branch (`gl-be3600`) is a complete, buildable OpenWrt tree:
-[perceival/openwrt-flint3](https://github.com/perceival/openwrt-flint3)
-(`flint3-be9300` at `b12c854`, target `qualcommbe/ipq53xx`, kernel 6.18) with
-the GL-BE3600 added in one commit, and the package feeds pinned to the
-revisions the tested images were built from. It builds two images: a stock
-OpenWrt image and an extended one with USB modem, tethering, storage, file
-sharing and VPN support. Nothing here is in official OpenWrt: the `ipq53xx`
-subtarget itself is not upstream yet, and the 5 GHz radio depends on an
-out-of-tree driver patch.
+Complete, buildable OpenWrt tree.
+
+Based on [perceival/openwrt-flint3](https://github.com/perceival/openwrt-flint3)
+(`flint3-be9300` at `b12c854`, target `qualcommbe/ipq53xx`, kernel 6.18), with
+the package feeds pinned to the revisions the tested images were built from.
+
+Two images: a stock OpenWrt image and an extended one with USB modem,
+tethering, storage, file sharing and VPN support. Prebuilt images are on the
+[Releases](https://github.com/fivefold3/openwrt-gl-be3600/releases) page.
+
+Nothing here is in official OpenWrt: the `ipq53xx` subtarget itself is not
+upstream yet, and the 5 GHz radio depends on an out-of-tree driver patch.
 
 > [!WARNING]
 > **Unofficial, community port. Not affiliated with, endorsed by or supported
@@ -268,13 +271,13 @@ come from the same build as the image that is running.
 
 ## What this branch adds
 
-Everything is in the one commit on top of `b12c854`:
+Everything is in the commits on top of `b12c854`:
 
 | Path | Purpose |
 |---|---|
 | `target/linux/qualcommbe/dts/ipq5332-gl-be3600.dts` | Device tree, derived from the stock firmware's DTB |
 | `target/linux/qualcommbe/image/ipq53xx.mk`, `image/gl-be3600-factory.bootscript` | Device definition: LZMA kernel FIT (`config@mi04.1-c2`), UBI, GL-format factory image, hardware package list |
-| `target/linux/qualcommbe/ipq53xx/config-default` | pstore/ramoops; framebuffer, fbtft, backlight, i2c-gpio, evdev and touch built in |
+| `target/linux/qualcommbe/ipq53xx/config-default` | pstore/ramoops; framebuffer, fbtft, backlight, i2c-gpio, evdev and touch built in; ARMv8 CE AES/GHASH (from openwrt-flint3 `20ccc9b4c6`) |
 | `target/linux/qualcommbe/ipq53xx/base-files/…` | network/MAC/country setup (`02_network`), OEM name, ath12k caldata extraction for both radios, sysupgrade handling and the factory-image guard (`platform.sh`), the country `uci-defaults` script, and a hotplug script that stops a firmware crash waiting five minutes for a coredump reader |
 | `target/linux/qualcommbe/patches-6.18/2990`, `2991` | dwc3-qcom: interconnect paths up before the core probe; `mock_utmi` handed to the core as its 60 MHz reference clock. Without them a rebind hangs and high-speed devices fail every descriptor read |
 | `target/linux/qualcommbe/patches-6.18/2995` | fbtft driver for the ST7789P3 panel (stock init sequence, frame-memory offsets 82/18, TE sync, backlight coupling) |
@@ -284,6 +287,8 @@ Everything is in the one commit on top of `b12c854`:
 | `…/ath12k/329` | do not drop a whole fw-stats event because an AP vdev has no peer (fixes LuCI stalling with AP + station on one radio) |
 | `…/ath12k/330` | do not touch freed TX bank profiles after a failed recovery |
 | `…/ath12k/331` | spread the AHB data-path interrupts over the CPUs |
+| `target/linux/qualcommbe/patches-6.18/0425`, `0426` | EDMA Tx completion: bounds-check the fragment index and unmap the fragment's real address. Backported from openwrt-flint3 (`36652ea55b`, `4c566cece3`) |
+| `package/network/config/wifi-scripts/…` | `disassoc_low_ack` defaults to 0, so stations are not kicked on spurious low-ACK reports. Backported from openwrt-flint3 (`514fc35ed1`, `88d31e06f9`) |
 | `package/network/utils/iwinfo/patches/200`, `201` | device names for IPQ5332/QCN6432; scanning no longer leaves an interface up |
 | `package/firmware/ipq-wifi/…/board-glinet_gl-be3600.ipq5332` | 2.4 GHz board data container |
 | `package/utils/slate-spinner/` | the side-screen spinner (extended image) |
