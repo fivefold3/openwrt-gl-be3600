@@ -43,13 +43,43 @@ gl_remove_oem_wifi_fw() {
 	}
 }
 
+# Stock firmware images and our factory.bin are QSDK container FITs whose
+# "ubi" section holds the whole ubinized UBI image of the rootfs partition.
+# Extract it (same section resolution as stock's platform_prepare_sysupgrade)
+# and write it with nand_upgrade_ubinized (detach + ubiformat the rootfs MTD),
+# the same route stock's do_flash_ubi takes on this 2K-page NAND. This makes
+# returning to stock firmware from OpenWrt a plain sysupgrade.
+gl_be3600_do_upgrade_fit() {
+	local fullname pos
+
+	fullname=$(dumpimage -l "$1" | sed -n 's,^ Image [0-9]* (\([^)]*\)),\1,p' | grep "^ubi" | head -n1)
+	[ -n "$fullname" ] || {
+		echo "Unable to find ubi section in $1"
+		return 1
+	}
+
+	pos=$(dumpimage -l "$1" | grep "(${fullname})" | awk '{print $2}')
+	[ -n "$pos" ] || return 1
+
+	dumpimage -o /tmp/ubi.bin -T flat_dt -p "$pos" "$1" > /dev/null || return 1
+
+	nand_upgrade_ubinized /tmp/ubi.bin cat
+}
+
 platform_do_upgrade() {
 	case "$(board_name)" in
 	gl.inet,gl-be3600)
 		CI_UBIPART="rootfs"
-		gl_be6500_remove_oem_rootfs || return 1
-		gl_remove_oem_wifi_fw || return 1
-		nand_do_upgrade "$1"
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			# Stock firmware / factory FIT: replace the whole UBI and
+			# never carry OpenWrt config into the stock system.
+			UPGRADE_BACKUP=""
+			gl_be3600_do_upgrade_fit "$1"
+		else
+			gl_be6500_remove_oem_rootfs || return 1
+			gl_remove_oem_wifi_fw || return 1
+			nand_do_upgrade "$1"
+		fi
 		;;
 	gl.inet,gl-be6500)
 		CI_UBIPART="rootfs"
@@ -77,17 +107,20 @@ platform_check_image() {
 
 	case "$(board_name)" in
 	gl.inet,gl-be3600)
-		# factory.bin is a QSDK container FIT (script node + the whole UBI).
-		# nand_do_platform_check deliberately ACCEPTS "fit" - on many NAND
-		# boards a kernel FIT is a legitimate sysupgrade image - but on this
-		# one the only valid sysupgrade image is the tar, and nand_upgrade_fit
-		# would write the whole container into the kernel UBI volume and leave
-		# the device unbootable. Verified: platform_check_image
-		# returned 0 for factory.bin with nand_do_platform_check alone.
-		if [ "$(get_magic_long "$1")" = "d00dfeed" ]; then
-			echo "This is the factory image (FIT). Flash it with U-Boot"
-			echo "recovery or from stock firmware, not with sysupgrade."
-			return 1
+		# FIT images: the stock firmware and our factory.bin are QSDK
+		# container FITs whose "ubi" section holds the whole ubinized UBI
+		# of the rootfs partition. Accept them here and flash them via
+		# gl_be3600_do_upgrade_fit - the same route stock's do_flash_ubi
+		# takes (extract ubi, ubiformat rootfs). A FIT without an ubi
+		# section (e.g. a bare kernel .itb) is rejected: nand_do_upgrade
+		# would write the whole container into the kernel UBI volume and
+		# leave the device unbootable.
+		if dumpimage -l "$1" >/dev/null 2>&1; then
+			dumpimage -l "$1" | grep -q "^ Image.*(ubi" || {
+				echo "Invalid image: no ubi section found"
+				return 1
+			}
+			return 0
 		fi
 		# The tar is built as sysupgrade-glinet_gl-be3600/ - the image profile
 		# name, NOT board_name (gl.inet,gl-be3600). nand_do_platform_check only

@@ -107,7 +107,7 @@ define Device/glinet_gl-be3600
 	# compatible will also accept this image. Accepted deliberately for the
 	# stock->OpenWrt hop; there is no per-board warning mechanism for it
 	# (DEVICE_COMPAT_MESSAGE only fires on a DEVICE_COMPAT_VERSION change).
-	SUPPORTED_DEVICES += gl.inet,gl-be3600 qcom,ipq5332-ap-mi04.1-c2
+	SUPPORTED_DEVICES += gl.inet,gl-be3600 gl-be3600 qcom,ipq5332-ap-mi04.1-c2
 	BLOCKSIZE := 128k
 	PAGESIZE := 2048
 	KERNEL_INSTALL := 1
@@ -130,7 +130,7 @@ define Device/glinet_gl-be3600
 	# default. USB storage, filesystems and modem drivers are left to the
 	# image configuration (configs/be3600-extra.config).
 	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332 \
-		ipq-wifi-glinet_gl-be3600 kmod-hwmon-pwmfan kmod-qrtr-smd
+		ipq-wifi-glinet_gl-be3600 kmod-hwmon-pwmfan kmod-qrtr-smd dumpimage
 endef
 TARGET_DEVICES += glinet_gl-be3600
 
